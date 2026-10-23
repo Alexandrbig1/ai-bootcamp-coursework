@@ -16,14 +16,14 @@ load_dotenv(_ENV_PATH)
 app = FastAPI()
 client = OpenAI()  # Reads OPENAI_API_KEY from the environment; never hardcode keys.
 
-# Stage 4 default — strong general model; swap at request time for the live demo.
-DEFAULT_MODEL = "gpt-4o"
+# Stage 4 default — cheap model so a public URL can't run up the bill; swap at request time.
+DEFAULT_MODEL = "gpt-4o-mini"
 
 # Stage 5 — per-1K-token input/output USD (derived from OpenAI list prices).
+# Doubles as the allowlist: /ask rejects any model that is not priced here.
 MODEL_PRICES_PER_1K: dict[str, tuple[float, float]] = {
     "gpt-4o": (0.0025, 0.01),
     "gpt-4o-mini": (0.00015, 0.0006),
-    "o3-mini": (0.0011, 0.0044),
 }
 
 
@@ -120,6 +120,12 @@ def ask(body: AskRequest) -> AskResponse:
     """Answer one question with structured output, guardrails, and cost visibility."""
 
     model = body.model or DEFAULT_MODEL
+    # Wallet guard: reject unpriced models before any tokens are spent.
+    if model not in MODEL_PRICES_PER_1K:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported model '{model}'. Allowed: {', '.join(MODEL_PRICES_PER_1K)}",
+        )
     last_error: str | None = None
 
     # Stage 3: one retry keeps the logic legible while still protecting callers.
