@@ -10,3 +10,7 @@ __pycache__/
 venv/
 .venv/
 env/
+
+# Local only: course spec and sample corpus (not ours to publish)
+/ASSIGNMENT-2.md
+/data/
