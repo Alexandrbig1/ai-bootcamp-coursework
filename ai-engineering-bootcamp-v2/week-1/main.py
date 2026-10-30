@@ -2,9 +2,10 @@
 
 import time
 from pathlib import Path
+from typing import Annotated
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query, Response
 from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
 
@@ -169,13 +170,14 @@ def ask(body: AskRequest) -> AskResponse:
 
 # Week 2 — ingest: plain text in; chunked, embedded and upserted to Pinecone (see rag.py).
 MAX_INGEST_CHARS = 100_000
+SLUG_PATTERN = r"^[a-z0-9_-]+$"  # no "#": it separates the document_id from the chunk number
 
 
 class IngestRequest(BaseModel):
     """One document per call; sending the same document_id again replaces it."""
 
     text: str = Field(max_length=MAX_INGEST_CHARS)
-    document_id: str = Field(pattern=r"^[a-z0-9_-]+$", max_length=100)  # becomes the chunk ID prefix
+    document_id: str = Field(pattern=SLUG_PATTERN, max_length=100)  # becomes the chunk ID prefix
     source: str | None = Field(default=None, max_length=200)
 
 
@@ -197,7 +199,10 @@ def ingest(body: IngestRequest) -> IngestResponse:
     chunks = rag.chunk_text(body.text)
     # Malformed fields are FastAPI's 422; well-formed text with nothing to index is a 400.
     if not chunks:
-        raise HTTPException(status_code=400, detail="text is empty or whitespace-only: nothing to index")
+        raise HTTPException(
+            status_code=400,
+            detail="text is empty or whitespace-only: nothing to index",
+        )
 
     chunk_ids, replaced, embedding_tokens = rag.upsert_document(
         body.document_id,
@@ -213,4 +218,88 @@ def ingest(body: IngestRequest) -> IngestResponse:
         embedding_tokens=embedding_tokens,
         # 8 decimals, not Week 1's 6: a short embedding costs less than $0.000001.
         cost_usd=round(rag.embedding_cost_usd(embedding_tokens), 8),
+    )
+
+
+# Week 2 — retrieval only, no LLM: prove the right chunks come back before /ask relies on them.
+MAX_QUESTION_CHARS = 1000
+PREVIEW_CHARS = 300
+
+
+class RetrievedChunk(BaseModel):
+    """One match, with enough text to judge whether it is the right chunk."""
+
+    chunk_id: str
+    document_id: str
+    source: str
+    score: float  # cosine similarity: higher means closer
+    preview: str
+
+
+class RetrieveResponse(BaseModel):
+    """Top-k matches, best first, plus what embedding the question cost."""
+
+    matches: list[RetrievedChunk]
+    embedding_tokens: int
+    cost_usd: float
+
+
+def text_preview(text: str) -> str:
+    """The start of a chunk on one line, so a list of matches reads at a glance."""
+
+    flat = " ".join(text.split())
+    return flat if len(flat) <= PREVIEW_CHARS else flat[:PREVIEW_CHARS].rstrip() + "..."
+
+
+@app.get("/debug/retrieve")
+def debug_retrieve(
+    q: Annotated[str, Query(max_length=MAX_QUESTION_CHARS)],
+    k: Annotated[int, Query(ge=1, le=10)] = 5,
+    document_id: Annotated[str | None, Query(pattern=SLUG_PATTERN, max_length=100)] = None,
+) -> RetrieveResponse:
+    """Question in, top-k chunks and scores out: the retrieval half of /ask, testable on its own."""
+
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="q is empty or whitespace-only")
+    matches, embedding_tokens = rag.retrieve(q, top_k=k, document_id=document_id)
+    return RetrieveResponse(
+        matches=[
+            RetrievedChunk(
+                chunk_id=match.chunk_id,
+                document_id=match.document_id,
+                source=match.source,
+                score=round(match.score, 4),
+                preview=text_preview(match.text),
+            )
+            for match in matches
+        ],
+        embedding_tokens=embedding_tokens,
+        cost_usd=round(rag.embedding_cost_usd(embedding_tokens), 8),
+    )
+
+
+class HealthResponse(BaseModel):
+    """Whether Pinecone answered, and how many vectors this service's namespace holds."""
+
+    status: str  # "ok" or "error"
+    index: str
+    namespace: str
+    vector_count: int | None = None
+    error: str | None = None
+
+
+@app.get("/health", response_model_exclude_none=True)
+def health(response: Response) -> HealthResponse:
+    """A real Pinecone round trip, so a missing key or index shows up here first, as a 503."""
+
+    try:
+        count = rag.namespace_vector_count()
+    except Exception as exc:  # any failure means "not ready": report its kind, never its details
+        response.status_code = 503
+        reason = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__
+        return HealthResponse(
+            status="error", index=rag.INDEX_NAME, namespace=rag.NAMESPACE, error=reason
+        )
+    return HealthResponse(
+        status="ok", index=rag.INDEX_NAME, namespace=rag.NAMESPACE, vector_count=count
     )

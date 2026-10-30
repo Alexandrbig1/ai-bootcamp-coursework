@@ -25,6 +25,8 @@ def target_label(url: str) -> str:
 
 
 def main() -> int:
+    """Ingest each file in turn; exit code 1 if any file failed."""
+
     if len(sys.argv) != 2:
         print("Usage: python ingest_folder.py <folder>")
         return 2
@@ -37,7 +39,11 @@ def main() -> int:
     total_chunks = total_tokens = failed = 0
     total_cost = 0.0
     for path in files:
-        payload = {"text": path.read_text(encoding="utf-8"), "document_id": path.stem, "source": path.name}
+        payload = {
+            "text": path.read_text(encoding="utf-8"),
+            "document_id": path.stem,
+            "source": path.name,
+        }
         try:
             # Generous timeout: a sleeping Render free instance can take a minute to wake up.
             response = httpx.post(f"{BASE_URL}/ingest", json=payload, timeout=180.0)
@@ -53,7 +59,10 @@ def main() -> int:
         total_chunks += data["chunks_indexed"]
         total_tokens += data["embedding_tokens"]
         total_cost += data["cost_usd"]
-        print(f"  {path.name:28} {data['chunks_indexed']:3} chunks  {data['status']:8}  {data['embedding_tokens']:5} tokens")
+        print(
+            f"  {path.name:28} {data['chunks_indexed']:3} chunks  {data['status']:8}"
+            f"  {data['embedding_tokens']:5} tokens"
+        )
 
     print(
         f"Total: {total_chunks} vectors from {len(files) - failed} of {len(files)} files, "

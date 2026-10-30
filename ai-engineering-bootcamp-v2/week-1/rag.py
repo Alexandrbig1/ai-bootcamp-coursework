@@ -2,6 +2,7 @@
 
 import os
 import re
+from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 
@@ -31,7 +32,7 @@ DELETE_BATCH = 1000
 _SEPARATOR = "\n\n"
 # Decorative lines such as ===== carry no meaning but use up chunk space and blur the vectors.
 _RULE_LINE = re.compile(r"^\s*([=\-_*~#])\1{2,}\s*$")
-# Fallbacks for a paragraph too long for one chunk, tried in order, each with the text that rejoins pieces.
+# Fallbacks for a paragraph too long for one chunk, in order: (split pattern, text that rejoins).
 _SPLITTERS = (
     (re.compile(r"(?<=[.!?])\s+"), " "),  # sentence ends
     (re.compile(r"\n"), "\n"),  # line breaks
@@ -96,7 +97,7 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
 
 
 def _split(text: str, max_len: int, level: int = 0) -> list[str]:
-    """Break text longer than max_len at sentence ends, then line breaks, then spaces, then anywhere."""
+    """Cut text over max_len at sentence ends, else line breaks, else spaces, else anywhere."""
 
     if len(text) <= max_len:
         return [text]
@@ -132,9 +133,9 @@ def _tail(chunk: str, overlap: int) -> str:
 
 
 def embed(texts: list[str]) -> tuple[list[list[float]], int]:
-    """Embed texts with the locked model; returns one vector per text, in order, plus billed tokens."""
+    """Embed with the locked model; returns one vector per text, in order, plus billed tokens."""
 
-    # One request is enough: the 100k-character ingest cap keeps us far below OpenAI's 2,048-input limit.
+    # One request is enough: 100k characters make ~150 chunks, far under OpenAI's 2,048-input cap.
     response = _openai().embeddings.create(model=EMBED_MODEL, input=texts)
     vectors = [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
     return vectors, response.usage.total_tokens
@@ -146,7 +147,9 @@ def embedding_cost_usd(tokens: int) -> float:
     return tokens / 1_000_000 * EMBED_PRICE_PER_1M_USD
 
 
-def upsert_document(document_id: str, chunks: list[str], source: str) -> tuple[list[str], bool, int]:
+def upsert_document(
+    document_id: str, chunks: list[str], source: str
+) -> tuple[list[str], bool, int]:
     """
     Embed and upsert one document's chunks as "{document_id}#{i}", then delete any chunks
     left over from a longer earlier version. Returns (chunk_ids, replaced, embedding_tokens).
@@ -156,7 +159,7 @@ def upsert_document(document_id: str, chunks: list[str], source: str) -> tuple[l
     chunk_ids = [f"{document_id}#{i}" for i in range(len(chunks))]
 
     index = get_index()
-    # The "#" matters: slugs can't contain it, so the prefix "handbook#" never matches "handbook-v2#0".
+    # "#" matters: slugs can't contain it, so prefix "handbook#" never matches "handbook-v2#0".
     pages = index.list(prefix=f"{document_id}#", namespace=NAMESPACE)
     existing = {item.id for page in pages for item in page.vectors}
 
@@ -165,7 +168,12 @@ def upsert_document(document_id: str, chunks: list[str], source: str) -> tuple[l
             {
                 "id": chunk_id,
                 "values": values,
-                "metadata": {"document_id": document_id, "chunk_index": i, "source": source, "text": chunk},
+                "metadata": {
+                    "document_id": document_id,
+                    "chunk_index": i,
+                    "source": source,
+                    "text": chunk,
+                },
             }
             for i, (chunk_id, values, chunk) in enumerate(zip(chunk_ids, vectors, chunks))
         ],
@@ -179,3 +187,48 @@ def upsert_document(document_id: str, chunks: list[str], source: str) -> tuple[l
     for start in range(0, len(stale), DELETE_BATCH):
         index.delete(ids=stale[start : start + DELETE_BATCH], namespace=NAMESPACE)
     return chunk_ids, bool(existing), embedding_tokens
+
+
+@dataclass
+class Match:
+    """One retrieved chunk, flattened out of Pinecone's ScoredVector and its metadata."""
+
+    chunk_id: str
+    document_id: str
+    source: str
+    score: float
+    text: str
+
+
+def retrieve(
+    question: str, top_k: int = 5, document_id: str | None = None
+) -> tuple[list[Match], int]:
+    """Embed the question and return the top_k closest chunks, best first, plus embedding tokens."""
+
+    [vector], embedding_tokens = embed([question])
+    response = get_index().query(
+        vector=vector,
+        top_k=top_k,
+        namespace=NAMESPACE,
+        # Metadata filter: search inside one document instead of the whole namespace.
+        filter={"document_id": {"$eq": document_id}} if document_id else None,
+        include_metadata=True,
+    )
+    matches = [
+        Match(
+            chunk_id=match.id,
+            document_id=match.metadata["document_id"],
+            source=match.metadata["source"],
+            score=match.score,
+            text=match.metadata["text"],
+        )
+        for match in response.matches
+    ]
+    return matches, embedding_tokens
+
+
+def namespace_vector_count() -> int:
+    """Vectors in this service's namespace, as Pinecone counts them (lags writes slightly)."""
+
+    namespace = get_index().describe_index_stats().namespaces.get(NAMESPACE)
+    return namespace.vector_count if namespace else 0
