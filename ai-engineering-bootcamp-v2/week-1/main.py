@@ -8,6 +8,8 @@ from fastapi import FastAPI, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
 
+import rag
+
 # Load .env from this folder so the key is found regardless of shell working directory.
 _ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(_ENV_PATH)
@@ -162,4 +164,53 @@ def ask(body: AskRequest) -> AskResponse:
     raise HTTPException(
         status_code=502,
         detail=f"Model response failed schema validation after retry: {last_error}",
+    )
+
+
+# Week 2 — ingest: plain text in; chunked, embedded and upserted to Pinecone (see rag.py).
+MAX_INGEST_CHARS = 100_000
+
+
+class IngestRequest(BaseModel):
+    """One document per call; sending the same document_id again replaces it."""
+
+    text: str = Field(max_length=MAX_INGEST_CHARS)
+    document_id: str = Field(pattern=r"^[a-z0-9_-]+$", max_length=100)  # becomes the chunk ID prefix
+    source: str | None = Field(default=None, max_length=200)
+
+
+class IngestResponse(BaseModel):
+    """What was written, including the chunk IDs that /ask will cite."""
+
+    document_id: str
+    chunks_indexed: int
+    status: str  # "created" or "replaced"
+    chunk_ids: list[str]
+    embedding_tokens: int
+    cost_usd: float
+
+
+@app.post("/ingest")
+def ingest(body: IngestRequest) -> IngestResponse:
+    """Chunk, embed and upsert one document, replacing any earlier version of it."""
+
+    chunks = rag.chunk_text(body.text)
+    # Malformed fields are FastAPI's 422; well-formed text with nothing to index is a 400.
+    if not chunks:
+        raise HTTPException(status_code=400, detail="text is empty or whitespace-only: nothing to index")
+
+    chunk_ids, replaced, embedding_tokens = rag.upsert_document(
+        body.document_id,
+        chunks,
+        # Pinecone metadata can't hold null, so a missing source falls back to the document_id.
+        source=body.source or body.document_id,
+    )
+    return IngestResponse(
+        document_id=body.document_id,
+        chunks_indexed=len(chunk_ids),
+        status="replaced" if replaced else "created",
+        chunk_ids=chunk_ids,
+        embedding_tokens=embedding_tokens,
+        # 8 decimals, not Week 1's 6: a short embedding costs less than $0.000001.
+        cost_usd=round(rag.embedding_cost_usd(embedding_tokens), 8),
     )
