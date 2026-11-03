@@ -80,7 +80,7 @@ POST /ask     question → embedding → Pinecone top-k → grounding prompt wit
 ```
 
 - Pinecone serverless index `coursework-rag` (cosine, aws us-east-1), namespace `northwind`. Each chunk stores `document_id`, `chunk_index`, `source` and `text`.
-- Code checks every answer: citations must be retrieved chunk IDs, an answer needs at least one, and a refusal has none. When nothing matches at all, `/ask` refuses without calling the model.
+- Code checks every answer: citations must be retrieved chunk IDs and a real answer needs at least one, with one retry and then a 502. The code writes every refusal itself, in one exact format. When nothing matches at all, `/ask` refuses without calling the model.
 
 ### Endpoints
 
@@ -88,7 +88,7 @@ POST /ask     question → embedding → Pinecone top-k → grounding prompt wit
 |---|---|
 | `POST /ingest` | `{text, document_id, source?}` → chunk, embed, upsert. Returns `chunk_ids`, `status` (`created` or `replaced`), `embedding_tokens`, `cost_usd`. |
 | `GET /debug/retrieve?q=…&k=5&document_id=…` | Retrieval only, no LLM: the top-k chunks with scores and previews. |
-| `POST /ask` | Week 1's request and response, plus optional `top_k` (1–10) and `document_id`. Adds `citations` and `refused` to the answer, and `retrieved` and `embedding_tokens` to the response. |
+| `POST /ask` | Week 1's request and response, plus optional `top_k` (1–10) and `document_id`. Adds `citations` and `refused` to the answer, and `retrieved` and `embedding_tokens` to the response. `tokens_used` and `cost_usd` cover every model call in the request, including a failed first attempt. |
 | `GET /health` | Index, namespace and vector count; a 503 with the reason when Pinecone isn't usable. |
 
 ### Run it
@@ -114,6 +114,7 @@ python test_all_stages.py                 # Week 1 tests; Stage 5 now goes throu
 - A folder of `.txt` files: `python ingest_folder.py path/to/folder`. Each file becomes one document, and its name without `.txt` is the `document_id` (lowercase letters, digits, `-` and `_`).
 - One document: the **Ingest** tab in `rag_page.py`, or `POST /ingest`.
 - Sending a `document_id` again replaces that document, with no duplicates and no leftover chunks.
+- To remove a document, run `python delete_document.py <document_id>`. It deletes the chunks by ID prefix and prints the vector count. It's a local script on purpose, never an endpoint, so only someone holding the Pinecone key can delete.
 
 ### curl (replace YOUR-SERVICE)
 
@@ -147,6 +148,8 @@ curl -s https://YOUR-SERVICE.onrender.com/health
 - **A score cutoff can't spot a missing answer.** The parental-leave question scores 0.53, higher than the correct mileage chunk at 0.35, so refusals come from the grounding prompt and the code checks instead.
 - **A document gave orders.** The product spec says "say you need Engineering confirmation". The prompt treats chunk text as data, so "How much does a WB-9 cost?" still gets the exact refusal.
 - **Pinecone is eventually consistent.** Writes show up after a short delay, so the tests poll after each ingest instead of reading straight back.
+- **Failed attempts weren't counted** (found in code review). With `force_bad`, the first call raised before its usage was read, and a retry overwrote the previous attempt's numbers, so `tokens_used` and `cost_usd` understated the spend. Usage now comes from the raw response, read before parsing can fail, and adds up across attempts.
+- **A sloppy refusal could end in a 502** (found in code review). The model had to write the refusal character for character, so any variation, such as a curly apostrophe, failed the check and used up the retry. Now the code owns the format: when the model sets `refused=true` or answers with exactly the refusal text, the code writes the refusal itself. Real answers still need valid citations, with one retry and then a 502.
 
 ## Project layout
 
@@ -156,6 +159,7 @@ week-1/
 ├── rag.py               # Week 2: chunking, embeddings, Pinecone, grounding prompt and checks
 ├── create_index.py      # Week 2: one-time Pinecone index setup
 ├── ingest_folder.py     # Week 2: POST every .txt file in a folder to /ingest
+├── delete_document.py   # Week 2: local script that removes one document's chunks
 ├── rag_page.py          # Week 2: Streamlit Ingest / Retrieve / Ask page
 ├── test_rag.py          # Week 2: RAG smoke tests on a throwaway namespace
 ├── serve_stage1.py … serve_stage5.py

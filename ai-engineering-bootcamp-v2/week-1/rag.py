@@ -147,6 +147,22 @@ def embedding_cost_usd(tokens: int) -> float:
     return tokens / 1_000_000 * EMBED_PRICE_PER_1M_USD
 
 
+def document_chunk_ids(document_id: str) -> set[str]:
+    """Every stored chunk ID of one document, found by ID prefix."""
+
+    # "#" matters: slugs can't contain it, so prefix "handbook#" never matches "handbook-v2#0".
+    pages = get_index().list(prefix=f"{document_id}#", namespace=NAMESPACE)
+    return {item.id for page in pages for item in page.vectors}
+
+
+def delete_chunks(chunk_ids: set[str]) -> None:
+    """Delete chunks by ID, in batches Pinecone accepts."""
+
+    ids = sorted(chunk_ids)
+    for start in range(0, len(ids), DELETE_BATCH):
+        get_index().delete(ids=ids[start : start + DELETE_BATCH], namespace=NAMESPACE)
+
+
 def upsert_document(
     document_id: str, chunks: list[str], source: str
 ) -> tuple[list[str], bool, int]:
@@ -157,13 +173,9 @@ def upsert_document(
 
     vectors, embedding_tokens = embed(chunks)
     chunk_ids = [f"{document_id}#{i}" for i in range(len(chunks))]
+    existing = document_chunk_ids(document_id)
 
-    index = get_index()
-    # "#" matters: slugs can't contain it, so prefix "handbook#" never matches "handbook-v2#0".
-    pages = index.list(prefix=f"{document_id}#", namespace=NAMESPACE)
-    existing = {item.id for page in pages for item in page.vectors}
-
-    index.upsert(
+    get_index().upsert(
         vectors=[
             {
                 "id": chunk_id,
@@ -183,9 +195,7 @@ def upsert_document(
     )
 
     # Upsert first, prune second, so the document never disappears from the index mid-update.
-    stale = sorted(existing - set(chunk_ids))
-    for start in range(0, len(stale), DELETE_BATCH):
-        index.delete(ids=stale[start : start + DELETE_BATCH], namespace=NAMESPACE)
+    delete_chunks(existing - set(chunk_ids))
     return chunk_ids, bool(existing), embedding_tokens
 
 
@@ -279,20 +289,11 @@ def grounding_messages(question: str, matches: list[Match]) -> Messages:
     ]
 
 
-def check_grounding(
-    answer: str, citations: list[str], refused: bool, retrieved_ids: set[str]
-) -> None:
-    """Raise ValueError when a parsed answer breaks the citation rules, so /ask retries it."""
+def check_citations(citations: list[str], retrieved_ids: set[str]) -> None:
+    """Raise ValueError unless a real answer cites at least one chunk, all of them retrieved."""
 
+    if not citations:
+        raise ValueError("an answer must cite at least one retrieved chunk")
     unknown = [chunk_id for chunk_id in citations if chunk_id not in retrieved_ids]
     if unknown:
         raise ValueError(f"cited chunks that were not retrieved: {unknown}")
-    if refused:
-        if citations:
-            raise ValueError("a refusal must not cite chunks")
-        if answer != REFUSAL_TEXT:
-            raise ValueError(f"a refusal must say exactly {REFUSAL_TEXT!r}, got {answer!r}")
-    elif not citations:
-        raise ValueError("an answer must cite at least one retrieved chunk")
-    elif answer == REFUSAL_TEXT:
-        raise ValueError("the refusal text needs refused=true")

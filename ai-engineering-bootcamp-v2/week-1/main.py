@@ -5,6 +5,7 @@ chunking, embeddings, Pinecone and the grounding prompt live in rag.py.
 """
 
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 
@@ -73,10 +74,10 @@ class AskResponse(BaseModel):
     """Typed response so callers always get the same shape back."""
 
     answer: Answer
-    tokens_used: int
+    tokens_used: int  # Week 2 — every model call in the request, failed attempts included
     model: str
     latency_ms: int
-    cost_usd: float  # Week 2 — now includes the question's embedding
+    cost_usd: float  # Week 2 — those same model calls plus the question's embedding
     # Week 2 — what the model was shown, and the question's embedding tokens.
     retrieved: list[RetrievedRef]
     embedding_tokens: int
@@ -90,37 +91,51 @@ def compute_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> 
     return (prompt_tokens / 1000 * input_per_1k) + (completion_tokens / 1000 * output_per_1k)
 
 
-def call_model_structured(messages: rag.Messages, model: str) -> tuple[Answer, int, int, int]:
+@dataclass
+class Usage:
+    """Week 2 — tokens across every model call in one request, failed attempts included."""
+
+    total: int = 0
+    prompt: int = 0
+    completion: int = 0
+
+    def add(self, billed: dict | None) -> None:
+        """Add the `usage` object of one call's JSON response."""
+
+        billed = billed or {}
+        self.total += billed.get("total_tokens", 0)
+        self.prompt += billed.get("prompt_tokens", 0)
+        self.completion += billed.get("completion_tokens", 0)
+
+
+def call_model_structured(messages: rag.Messages, model: str, usage: Usage) -> Answer:
     """
     Stage 2 center: OpenAI structured output forces exactly the Answer schema.
-    Returns parsed answer plus token counts from billing metadata.
+    Returns the parsed answer and adds the call's token counts from billing metadata to usage.
     Week 2: takes grounding messages (rules, chunks, question) rather than a bare question.
     """
 
-    completion = client.chat.completions.parse(
+    response = client.chat.completions.with_raw_response.parse(
         model=model,
         messages=messages,
         response_format=Answer,
     )
+    # The call is billed whatever happens next, and parse() validates as it goes: count it first.
+    usage.add(response.http_response.json().get("usage"))
 
-    parsed = completion.choices[0].message.parsed
+    parsed = response.parse().choices[0].message.parsed
     if parsed is None:
         raise ValueError("Model returned no parseable structured output")
-
-    usage = completion.usage
-    total = usage.total_tokens if usage else 0
-    prompt_tokens = usage.prompt_tokens if usage else 0
-    completion_tokens = usage.completion_tokens if usage else 0
-    return parsed, total, prompt_tokens, completion_tokens
+    return parsed
 
 
-def call_model_unsafe(messages: rag.Messages, model: str) -> tuple[Answer, int, int, int]:
+def call_model_unsafe(messages: rag.Messages, model: str, usage: Usage) -> Answer:
     """
     Stage 3 demo path: free-form JSON call, then validate locally.
     The bad instruction makes confidence a string so Pydantic rejects it reliably.
     """
 
-    completion = client.chat.completions.create(
+    response = client.chat.completions.with_raw_response.create(
         model=model,
         messages=[
             *messages,
@@ -134,15 +149,27 @@ def call_model_unsafe(messages: rag.Messages, model: str) -> tuple[Answer, int, 
         ],
     )
 
-    raw = completion.choices[0].message.content or ""
-    # Guardrail: refuse malformed output instead of passing it through to clients.
-    answer = Answer.model_validate_json(raw)
+    # Count the call first: this path exists to fail the validation below.
+    usage.add(response.http_response.json().get("usage"))
 
-    usage = completion.usage
-    total = usage.total_tokens if usage else 0
-    prompt_tokens = usage.prompt_tokens if usage else 0
-    completion_tokens = usage.completion_tokens if usage else 0
-    return answer, total, prompt_tokens, completion_tokens
+    raw = response.parse().choices[0].message.content or ""
+    # Guardrail: refuse malformed output instead of passing it through to clients.
+    return Answer.model_validate_json(raw)
+
+
+def enforce_grounding(answer: Answer, retrieved_ids: set[str]) -> Answer:
+    """
+    Week 2 — the code owns the refusal format: any refusal comes back in one exact shape, whatever
+    the model wrote. A real answer must cite at least one chunk, all of them retrieved; if not,
+    check_citations raises ValueError and the answer gets the same one retry as a schema failure.
+    """
+
+    if answer.refused or answer.answer == rag.REFUSAL_TEXT:
+        return answer.model_copy(
+            update={"answer": rag.REFUSAL_TEXT, "citations": [], "refused": True}
+        )
+    rag.check_citations(answer.citations, retrieved_ids)
+    return answer
 
 
 @app.post("/ask")
@@ -191,6 +218,7 @@ def ask(body: AskRequest) -> AskResponse:
 
     messages = rag.grounding_messages(body.question, matches)
     retrieved_ids = {m.chunk_id for m in matches}
+    usage = Usage()
     last_error: str | None = None
 
     # Stage 3: one retry keeps the logic legible while still protecting callers.
@@ -199,24 +227,18 @@ def ask(body: AskRequest) -> AskResponse:
             # First attempt with force_bad uses the unsafe path; retry uses structured output.
             use_bad_path = body.force_bad and attempt == 0
             if use_bad_path:
-                answer, tokens_used, prompt_tokens, completion_tokens = call_model_unsafe(
-                    messages, model
-                )
+                answer = call_model_unsafe(messages, model, usage)
             else:
-                answer, tokens_used, prompt_tokens, completion_tokens = call_model_structured(
-                    messages, model
-                )
+                answer = call_model_structured(messages, model, usage)
 
-            # Week 2 — valid JSON can still cite chunks it never saw or refuse sloppily;
-            # check_grounding raises ValueError, so those answers get the same one retry.
-            rag.check_grounding(answer.answer, answer.citations, answer.refused, retrieved_ids)
+            answer = enforce_grounding(answer, retrieved_ids)
 
             latency_ms = int((time.perf_counter() - start) * 1000)
-            cost_usd = compute_cost_usd(model, prompt_tokens, completion_tokens) + embedding_cost
+            cost_usd = compute_cost_usd(model, usage.prompt, usage.completion) + embedding_cost
 
             return AskResponse(
                 answer=answer,
-                tokens_used=tokens_used,
+                tokens_used=usage.total,
                 model=model,
                 latency_ms=latency_ms,
                 cost_usd=round(cost_usd, 8),

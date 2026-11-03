@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""RAG smoke tests against a local server that uses a throwaway Pinecone namespace.
+"""RAG smoke tests: a local server on a throwaway Pinecone namespace, plus offline /ask checks.
 
 Run: .venv/bin/python test_rag.py
 Needs OPENAI_API_KEY and PINECONE_API_KEY in .env. Calls gpt-4o-mini only; a run costs well
 under a cent. The namespace is random per run and deleted at the end, whatever happens, so the
-real corpus is never touched.
+real corpus is never touched. The offline tests stub retrieval and the model to reach failures
+a real model won't produce on demand; they make no API calls.
 """
 
 import os
@@ -13,15 +14,25 @@ import sys
 import time
 import uuid
 from collections.abc import Callable
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
+from fastapi.testclient import TestClient
 
-import rag  # only for cleanup; every call below names the test namespace explicitly
+import main as api  # "main" is this file's own entry point below
+import rag  # for cleanup and the offline tests; calls that reach Pinecone name the test namespace
 from test_all_stages import WORKDIR, check, free_port, wait_up
 
 NAMESPACE = f"test-rag-{uuid.uuid4().hex[:8]}"
 DOC_ID = "plant-policy"
 QUESTION = "What is the quarterly budget for office plants?"
+
+# Offline tests: one model call as the API bills it, and the chunk the stubbed retrieval returns.
+BILLED = {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
+RETRIEVED = rag.Match(
+    chunk_id="doc#0", document_id="doc", source="doc.txt", score=0.9, text="Some text."
+)
 
 # Facts no model knows from training, in three paragraphs too long to share a chunk.
 DOC_V1 = """Zephyr Labs Office Plant Policy
@@ -95,11 +106,103 @@ def indexed_ids(base: str) -> set[str]:
     return {match["chunk_id"] for match in data.get("matches", [])}
 
 
+def model_answer(
+    text: str = "A real answer.", citations: list[str] | None = None, refused: bool = False
+) -> api.Answer:
+    """An Answer as the model might write it; it cites the retrieved chunk unless told otherwise."""
+
+    return api.Answer(
+        answer=text,
+        confidence=0.9,
+        sources_needed=False,
+        citations=[RETRIEVED.chunk_id] if citations is None else citations,
+        refused=refused,
+    )
+
+
+def ask_offline(*replies: api.Answer | Exception) -> tuple[int, dict, int]:
+    """
+    POST /ask in-process, with retrieval stubbed and one fake model reply per attempt. A reply is
+    an Answer, or an exception that parsing raises; every attempt bills BILLED, as a real call
+    would. Returns (HTTP status, JSON body, attempts made).
+    """
+
+    pending = iter(replies)
+
+    def fake_parse(**_kwargs) -> SimpleNamespace:
+        reply = next(pending)
+
+        def parse() -> SimpleNamespace:
+            if isinstance(reply, Exception):
+                raise reply
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(parsed=reply))])
+
+        return SimpleNamespace(
+            http_response=SimpleNamespace(json=lambda: {"usage": BILLED}), parse=parse
+        )
+
+    completions = SimpleNamespace(with_raw_response=SimpleNamespace(parse=fake_parse))
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    with (
+        patch.object(api, "client", fake_client),
+        patch.object(rag, "retrieve", return_value=([RETRIEVED], 3)),
+    ):
+        response = TestClient(api.app).post("/ask", json={"question": "Anything?"})
+    return response.status_code, response.json(), len(replies) - len(list(pending))
+
+
 def test_unpriced_model(base: str) -> bool:
     """Unpriced model: 422 before any tokens are spent"""
 
     status, data = call("POST", f"{base}/ask", json={"question": QUESTION, "model": "gpt-4"})
     return check("422", status == 422, f"HTTP {status}: {data.get('detail')}")
+
+
+def test_usage_adds_up_offline(_base: str) -> bool:
+    """Usage (offline): tokens and cost cover every attempt, including the one that failed"""
+
+    two_calls = api.compute_cost_usd(api.DEFAULT_MODEL, 200, 20) + rag.embedding_cost_usd(3)
+    ok = True
+    for label, first_reply in (
+        ("parsing failed", ValueError("no parseable output")),
+        ("wrong citation", model_answer(citations=["ghost#0"])),
+    ):
+        status, data, attempts = ask_offline(first_reply, model_answer())
+        tokens, cost = data.get("tokens_used"), data.get("cost_usd")
+        counted = status == 200 and attempts == 2 and tokens == 220 and cost == round(two_calls, 8)
+        ok &= check(label, counted, f"{label}, then OK: {attempts} calls, tokens={tokens}, ${cost}")
+    return ok
+
+
+def test_refusal_format_offline(_base: str) -> bool:
+    """Refusal format (offline): the code rewrites any refusal itself, with no retry"""
+
+    exact = {"answer": rag.REFUSAL_TEXT, "citations": [], "refused": True}
+    ok = True
+    for label, reply in (
+        ("refused=true, own wording, one citation", model_answer("No idea.", refused=True)),
+        ("refusal text, refused=false, one citation", model_answer(rag.REFUSAL_TEXT)),
+    ):
+        status, data, attempts = ask_offline(reply)
+        answer = data.get("answer", {})
+        got = {key: answer.get(key) for key in exact}
+        rewritten = status == 200 and attempts == 1 and got == exact
+        ok &= check(label, rewritten, f"{label}: HTTP {status}, {attempts} call, {got}")
+    return ok
+
+
+def test_bad_citations_offline(_base: str) -> bool:
+    """Citations (offline): a real answer with bad citations gets one retry, then a 502"""
+
+    ok = True
+    for label, reply in (
+        ("no citation", model_answer(citations=[])),
+        ("unretrieved citation", model_answer(citations=["ghost#0"])),
+    ):
+        status, data, attempts = ask_offline(reply, reply)
+        detail = data.get("detail")
+        ok &= check(label, status == 502 and attempts == 2, f"HTTP {status}, {attempts}: {detail}")
+    return ok
 
 
 def test_empty_namespace(base: str) -> bool:
@@ -157,12 +260,20 @@ def test_refusal(base: str) -> bool:
 
 
 def test_force_bad(base: str) -> bool:
-    """force_bad: attempt 1 breaks the schema, the retry recovers"""
+    """force_bad: attempt 1 breaks the schema, the retry recovers, and both calls are counted"""
 
+    _, normal = call("POST", f"{base}/ask", json={"question": QUESTION})
     status, data = call("POST", f"{base}/ask", json={"question": QUESTION, "force_bad": True})
     citations = data.get("answer", {}).get("citations", [])
     ok = check("recovers", status == 200, f"HTTP {status} (the retry should recover)")
     ok &= check("cited", bool(citations), f"citations={citations}")
+    # Counting only the retry would land near one normal call; two calls land well above it.
+    tokens, one_call = data.get("tokens_used", 0), normal.get("tokens_used", 0)
+    counted = one_call > 0 and tokens > 1.5 * one_call
+    ok &= check("tokens", counted, f"tokens_used={tokens}, one normal call={one_call}")
+    cost, one_cost = data.get("cost_usd", 0), normal.get("cost_usd", 0)
+    counted = one_cost > 0 and cost > 1.5 * one_cost
+    ok &= check("cost", counted, f"cost_usd={cost}, one normal call={one_cost}")
     return ok
 
 
@@ -178,14 +289,47 @@ def test_reingest(base: str) -> bool:
     return ok
 
 
+def test_delete_document(base: str) -> bool:
+    """delete_document.py: removes one document and leaves a similar name alone"""
+
+    sibling = f"{DOC_ID}-v2"
+    call("POST", f"{base}/ingest", json={"text": DOC_V2, "document_id": sibling})
+    # The script subtracts from Pinecone's count, and counts lag writes: let it settle first.
+    settled = wait_until(lambda: call("GET", f"{base}/health")[1].get("vector_count") == 2)
+    ok = check("settled", settled, "Pinecone counts 2 vectors: the document and its sibling")
+
+    result = subprocess.run(
+        [sys.executable, "delete_document.py", DOC_ID],
+        cwd=WORKDIR,
+        env={**os.environ, "PINECONE_NAMESPACE": NAMESPACE},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = result.stdout.strip().splitlines() or ["(no output)"]
+    ok &= check("script", result.returncode == 0, f"exit {result.returncode}: {output[-1]}")
+
+    def listed() -> set[str]:
+        pages = rag.get_index().list(prefix=DOC_ID, namespace=NAMESPACE)
+        return {item.id for page in pages for item in page.vectors}
+
+    left = {f"{sibling}#0"}
+    ok &= check("sibling kept", wait_until(lambda: listed() == left), f"only {left} is left")
+    return ok
+
+
 TESTS = [
     test_unpriced_model,
+    test_usage_adds_up_offline,
+    test_refusal_format_offline,
+    test_bad_citations_offline,
     test_empty_namespace,  # must run before anything is ingested
     test_ingest,
     test_cited_answer,
     test_refusal,
     test_force_bad,
     test_reingest,
+    test_delete_document,  # must run after test_reingest, which leaves one chunk of the document
 ]
 
 
