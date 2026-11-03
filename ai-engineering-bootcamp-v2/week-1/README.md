@@ -146,10 +146,66 @@ curl -s https://YOUR-SERVICE.onrender.com/health
 - **Costs rounded to zero.** A 10-token question embedding costs $0.0000002, which Week 1's 6-decimal rounding shows as 0, so `cost_usd` now has 8 decimals.
 - **Right document, wrong chunk.** "How many remote days are allowed?" ranks the chunk about international remote work first and the answer chunk third. That's why `top_k` defaults to 5.
 - **A score cutoff can't spot a missing answer.** The parental-leave question scores 0.53, higher than the correct mileage chunk at 0.35, so refusals come from the grounding prompt and the code checks instead.
-- **A document gave orders.** The product spec says "say you need Engineering confirmation". The prompt treats chunk text as data, so "How much does a WB-9 cost?" still gets the exact refusal.
+- **A document gave orders.** The product spec says "say you need Engineering confirmation", and the prompt treats chunk text as data. An early check looked like proof because "How much does a WB-9 cost?" got the exact refusal, but at `top_k=5` that chunk ranks 6th, so the model never saw it. The real test is `top_k=10`, where the chunk is in the context and the bot still refused 3 times out of 3.
 - **Pinecone is eventually consistent.** Writes show up after a short delay, so the tests poll after each ingest instead of reading straight back.
 - **Failed attempts weren't counted** (found in code review). With `force_bad`, the first call raised before its usage was read, and a retry overwrote the previous attempt's numbers, so `tokens_used` and `cost_usd` understated the spend. Usage now comes from the raw response, read before parsing can fail, and adds up across attempts.
 - **A sloppy refusal could end in a 502** (found in code review). The model had to write the refusal character for character, so any variation, such as a curly apostrophe, failed the check and used up the retry. Now the code owns the format: when the model sets `refused=true` or answers with exactly the refusal text, the code writes the refusal itself. Real answers still need valid citations, with one retry and then a 502.
+
+### Golden set
+
+`golden_set.json` holds 8 questions whose expected answers were checked by hand against the documents: 6 answerable, one from each document, and 2 that must refuse. A retrieval hit means the row's evidence phrase appears in a retrieved chunk, so the same set works at any chunk size.
+
+```bash
+python eval_golden.py                                               # full run, against the local server
+python eval_golden.py --retrieval-only --namespace northwind --k 5  # retrieval only: no server, no LLM
+python chunk_experiment.py                                          # 800/100 vs 400/50, retrieval only
+```
+
+Runs are saved to `eval_results/`, which is git-ignored.
+
+**Results.** One full run on 2026-11-02 at the default `top_k=5` over the 60 Northwind chunks, with gpt-4o-mini answering and a gpt-4o-mini judge checking each answer against the chunks it cites. Rank is where the evidence phrase first appears in the retrieved chunks.
+
+| Row | Question | Expected answer | Rank | Refusal OK | Correct | Faithful |
+|---|---|---|---|---|---|---|
+| `remote-days` | How many remote days are allowed? | Up to three days per week | 3 | yes | yes | yes |
+| `mileage-rate` | What is the mileage rate? | 45 pence per mile, for travel over 50 miles | 1 | yes | yes | yes |
+| `lost-laptop` | How quickly must a lost laptop be reported? | Within one hour | 1 | yes | yes | yes |
+| `wb9-payload` | What is the WB-9 payload limit? | 25 kg | 1 | yes | yes | yes |
+| `pol220-owner` | Who owns policy POL-220? | Head of IT | 2 | yes | yes | yes |
+| `cambridge-hours` | What time does the Cambridge office open? | 07:30 on weekdays | 2 | yes | yes | yes |
+| `parental-leave` | What is the parental leave policy? | Must refuse | - | yes | yes | - |
+| `wb9-price` | How much does a WB-9 cost? | Must refuse | - | yes | yes | - |
+
+| Score | Result | Covers |
+|---|---|---|
+| hit@5 | 6/6 | answerable rows |
+| hit@1 | 3/6 | answerable rows |
+| MRR | 0.72 | answerable rows |
+| Refusal accuracy | 8/8 | all rows |
+| Correctness | 8/8 | all rows |
+| Faithfulness | 6/6 | answerable rows |
+| Total cost | $0.0020 | `/ask` $0.0015 + judge $0.0005 |
+
+**Chunk-size comparison.** Retrieval only, top 5, with each size in its own namespace.
+
+| Chunk size / overlap | Chunks | Embedding tokens | hit@1 | hit@5 | MRR |
+|---|---|---|---|---|---|
+| 800/100 (default) | 60 | 8,901 | 3/6 | 6/6 | 0.72 |
+| 400/50 | 142 | 9,276 | 4/6 | 5/6 | 0.75 |
+
+At 400/50, `remote-days` and `cambridge-hours` move up to rank 1, `mileage-rate` drops to rank 2, and `pol220-owner` falls out of the top 5. These numbers don't justify changing the default: `/ask` sends all five chunks to the model, so reaching the top 5 matters more than ranking first, and 400/50 needs 2.4 times the vectors.
+
+**The WB-9 decision.** "How much does a WB-9 cost?" must refuse. The documents state no price. Section 9 of the product spec says "If the answer is not here, say you need Engineering confirmation", but that sentence speaks to Support and Sales about "can it do X?" questions, and the bot treats chunk text as data.
+
+**What each result taught me**
+
+- **Retrieval (hit@5 6/6, hit@1 3/6, MRR 0.72):** The right chunk always reaches the model but ranks first only half the time, which is fine while `/ask` sends all five chunks.
+- **Refusals (8/8):** The prompt holds on a missing topic and on a near miss, though two refusal rows can't prove much.
+- **Correctness (8/8):** With the right chunk in the context, the model picks the right fact, but in a set this small one flipped row moves a score by at least 12 points.
+- **Faithfulness (6/6):** A judge that always says yes would score the same, so it also got three deliberately bad answers, and it rejected all three.
+- **Cost ($0.0020):** A full run is cheap enough to repeat after any change to retrieval or the prompt.
+- **Chunk size:** Summary scores can hide what matters, since 400/50 wins on MRR while losing the exact-ID row, so compare per question.
+- **WB-9 decision:** A refusal proves nothing about an instruction the model never saw, so check what was in the context before crediting the prompt.
 
 ## Project layout
 
@@ -160,6 +216,9 @@ week-1/
 ├── create_index.py      # Week 2: one-time Pinecone index setup
 ├── ingest_folder.py     # Week 2: POST every .txt file in a folder to /ingest
 ├── delete_document.py   # Week 2: local script that removes one document's chunks
+├── golden_set.json      # Week 2: 8 questions with expected answers and evidence phrases
+├── eval_golden.py       # Week 2: scores /ask against the golden set, with a judge
+├── chunk_experiment.py  # Week 2: compares chunk sizes on retrieval only
 ├── rag_page.py          # Week 2: Streamlit Ingest / Retrieve / Ask page
 ├── test_rag.py          # Week 2: RAG smoke tests on a throwaway namespace
 ├── serve_stage1.py … serve_stage5.py
