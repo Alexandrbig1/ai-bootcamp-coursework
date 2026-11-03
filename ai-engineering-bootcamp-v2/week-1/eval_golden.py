@@ -11,9 +11,10 @@ Only the judge's own check against known good and bad answers (exit code 1 if it
   .venv/bin/python eval_golden.py --check-judge
 
 Every eval starts with the pre-flight, and every full run also starts with the judge check. A hit
-is the first retrieved chunk of the row's expected document that holds its evidence phrase.
-Retrieval and faithfulness cover the answerable rows; refusal accuracy and correctness cover
-every row, so a wrong refusal counts.
+is the first retrieved chunk of the row's expected document that holds its evidence phrase. An
+answer is correct if it has one spelling of every required fact in must_include. Retrieval and
+faithfulness cover the answerable rows; refusal accuracy and correctness cover every row, so a
+wrong refusal counts.
 """
 
 import argparse
@@ -110,45 +111,60 @@ def cleaned_document(path: Path) -> str:
     return normalize(" ".join(chunks))
 
 
+def row_problems(row: dict, documents: dict[str, str]) -> list[str]:
+    """What's wrong with one answerable row; the phrase is only checked if the corpus is there."""
+
+    problems = []
+    facts = row["must_include"]
+    # "Every fact" is always true of an empty list, so a row with no facts would always be correct.
+    if not facts or not all(isinstance(fact, list) and fact for fact in facts):
+        problems.append("must_include needs required facts, each a non-empty list of spellings")
+
+    phrase, expected = normalize(row["evidence"]), row["expected_document_id"]
+    found = {name: text.count(phrase) for name, text in documents.items() if phrase in text}
+    found = found if phrase else {}  # an empty phrase matches everywhere, which means nothing
+    if documents and found != {expected: 1}:
+        where = ", ".join(f"{count}x in {name}" for name, count in found.items()) or "nowhere"
+        problems.append(f"{phrase!r} appears {where}; expected once, in {expected}")
+    return problems
+
+
 def preflight(rows: list[dict]) -> bool:
     """
-    Each evidence phrase must appear exactly once across the corpus, inside its expected document,
-    or a hit can't be trusted. Prints each row's result; False means stop. The corpus is
-    git-ignored, so a missing one only warns.
+    Each answerable row needs required facts, and its evidence phrase must appear exactly once
+    across the corpus, inside its expected document, or a hit can't be trusted. Prints each row's
+    result; False means stop. The corpus is git-ignored, so a missing one only warns.
     """
 
     documents = {path.stem: cleaned_document(path) for path in sorted(CORPUS_DIR.glob("*.txt"))}
     if not documents:
         print(f"Pre-flight WARNING: no documents in {CORPUS_DIR.relative_to(WORKDIR)}/.")
         print("Evidence phrases weren't checked; continuing.\n")
-        return True
 
     answerable = [row for row in rows if not row["should_refuse"]]
     failed = 0
-    print("Pre-flight: each evidence phrase must appear exactly once, in its expected document")
+    print("Pre-flight: required facts, and each phrase exactly once, in its expected document")
     for row in answerable:
-        phrase, expected = normalize(row["evidence"]), row["expected_document_id"]
-        found = {name: text.count(phrase) for name, text in documents.items() if phrase in text}
-        found = found if phrase else {}  # an empty phrase matches everywhere, which means nothing
-        if found == {expected: 1}:
-            print(f"  ok    {row['id']}: once, in {expected}")
-            continue
-        failed += 1
-        where = ", ".join(f"{count}x in {name}" for name, count in found.items()) or "nowhere"
-        print(f"  FAIL  {row['id']}: {phrase!r} appears {where}; expected once, in {expected}")
+        problems = row_problems(row, documents)
+        failed += bool(problems)
+        status = "; ".join(problems) or f"once, in {row['expected_document_id']}"
+        if not problems and not documents:
+            status = "required facts present"
+        print(f"  {'FAIL' if problems else 'ok  '}  {row['id']}: {status}")
 
-    print(f"{len(answerable) - failed} of {len(answerable)} evidence phrases OK.\n")
+    print(f"{len(answerable) - failed} of {len(answerable)} rows OK.\n")
     if failed:
-        print("Stopping: fix the phrases in golden_set.json before running an eval.")
+        print("Stopping: fix these rows in golden_set.json before running an eval.")
     return not failed
 
 
 def is_correct(row: dict, answer: str) -> bool:
-    """Any must_include term for an answer, case-insensitive; exactly REFUSAL_TEXT for a refusal."""
+    """One spelling of every required fact, case-insensitive; exactly REFUSAL_TEXT for a refusal."""
 
     if row["should_refuse"]:
         return answer == rag.REFUSAL_TEXT
-    return any(term.lower() in answer.lower() for term in row["must_include"])
+    text = answer.lower()
+    return all(any(spelling.lower() in text for spelling in fact) for fact in row["must_include"])
 
 
 def judge(question: str, answer: str, cited: dict[str, str]) -> tuple[bool | None, str, float]:

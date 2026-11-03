@@ -4,7 +4,7 @@
     "question": "How many remote days are allowed?",
     "expected_document_id": "doc1_handbook",
     "evidence": "Employees may work remotely up to three days per week.",
-    "must_include": ["three", "3 days"],
+    "must_include": [["three days", "3 days", "three remote days", "3 remote days"], ["per week", "a week", "each week"]],
     "should_refuse": false
   },
   {
@@ -12,15 +12,15 @@
     "question": "What is the mileage rate?",
     "expected_document_id": "doc2_expenses",
     "evidence": "Travel over 50 miles may be claimed at 45 pence per mile.",
-    "must_include": ["45"],
+    "must_include": [["45 pence", "45p"], ["50 miles"]],
     "should_refuse": false
   },
   {
     "id": "lost-laptop",
     "question": "How quickly must a lost laptop be reported?",
     "expected_document_id": "doc3_security",
-    "evidence": "Lost devices must be reported within one hour",
-    "must_include": ["one hour", "1 hour", "60 minutes"],
+    "evidence": "Lost devices must be reported within one hour to the security desk, as stated in Section 3.",
+    "must_include": [["one hour", "1 hour", "60 minutes"]],
     "should_refuse": false
   },
   {
@@ -28,7 +28,7 @@
     "question": "What is the WB-9 payload limit?",
     "expected_document_id": "doc4_product",
     "evidence": "payload capacity of 25 kg",
-    "must_include": ["25 kg", "25kg", "25 kilograms"],
+    "must_include": [["25 kg", "25kg", "25 kilograms"]],
     "should_refuse": false
   },
   {
@@ -36,7 +36,7 @@
     "question": "Who owns policy POL-220?",
     "expected_document_id": "doc5_it_acceptable_use",
     "evidence": "Owner: Head of IT",
-    "must_include": ["Head of IT"],
+    "must_include": [["Head of IT"]],
     "should_refuse": false
   },
   {
@@ -44,7 +44,7 @@
     "question": "What time does the Cambridge office open?",
     "expected_document_id": "doc6_facilities",
     "evidence": "Open 07:30 to 19:30 on weekdays",
-    "must_include": ["07:30", "7:30 am", "7:30am", "7:30 a.m"],
+    "must_include": [["07:30", "7:30 am", "7:30am", "7:30 a.m"], ["weekday", "monday to friday"]],
     "should_refuse": false
   },
   {
