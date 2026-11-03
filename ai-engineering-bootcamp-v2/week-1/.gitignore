@@ -14,3 +14,6 @@ env/
 # Local only: course spec and sample corpus (not ours to publish)
 /ASSIGNMENT-2.md
 /data/
+
+# Local only: golden-set eval runs
+/eval_results/

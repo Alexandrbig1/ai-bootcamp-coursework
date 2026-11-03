@@ -3,7 +3,7 @@
 
 Run: .venv/bin/python test_rag.py
 Needs OPENAI_API_KEY and PINECONE_API_KEY in .env. Calls gpt-4o-mini only; a run costs well
-under a cent. The namespace is random per run and deleted at the end, whatever happens, so the
+under a cent. The namespaces are random per run and deleted at the end, whatever happens, so the
 real corpus is never touched. The offline tests stub retrieval and the model to reach failures
 a real model won't produce on demand; they make no API calls.
 """
@@ -20,11 +20,18 @@ from unittest.mock import patch
 import httpx
 from fastapi.testclient import TestClient
 
+NAMESPACE = f"test-rag-{uuid.uuid4().hex[:8]}"
+OTHER_NAMESPACE = f"{NAMESPACE}-other"
+# Before importing rag, so that even its defaults in this process stay away from the real corpus.
+os.environ["PINECONE_NAMESPACE"] = NAMESPACE
+
+# pylint: disable=wrong-import-position
 import main as api  # "main" is this file's own entry point below
-import rag  # for cleanup and the offline tests; calls that reach Pinecone name the test namespace
+import rag
 from test_all_stages import WORKDIR, check, free_port, wait_up
 
-NAMESPACE = f"test-rag-{uuid.uuid4().hex[:8]}"
+# pylint: enable=wrong-import-position
+
 DOC_ID = "plant-policy"
 QUESTION = "What is the quarterly budget for office plants?"
 
@@ -318,6 +325,34 @@ def test_delete_document(base: str) -> bool:
     return ok
 
 
+def test_namespace_parameter(_base: str) -> bool:
+    """Namespace parameter: rag's writes and reads stay inside the namespace they're given"""
+
+    doc = "namespace-check"
+    chunks = ["First note about office plants.", "Second note about office plants."]
+    ids, _, _ = rag.upsert_document(doc, chunks, "test", namespace=OTHER_NAMESPACE)
+
+    def listed() -> set[str]:
+        return rag.document_chunk_ids(doc, namespace=OTHER_NAMESPACE)
+
+    def retrieved() -> set[str]:
+        matches, _ = rag.retrieve("office plants", namespace=OTHER_NAMESPACE)
+        return {match.chunk_id for match in matches}
+
+    ok = check("written", wait_until(lambda: listed() == set(ids)), f"{ids} in the given namespace")
+    untouched = not rag.document_chunk_ids(doc)
+    ok &= check("default untouched", untouched, "none of them in this process's default namespace")
+    ok &= check("retrieve", wait_until(lambda: retrieved() == set(ids)), "rag.retrieve reads there")
+    texts = rag.chunk_texts(ids, namespace=OTHER_NAMESPACE)
+    ok &= check("fetch", texts == dict(zip(ids, chunks)), "rag.chunk_texts returns their text")
+
+    # A shorter version must prune the leftover chunk in that same namespace.
+    ids, replaced, _ = rag.upsert_document(doc, chunks[:1], "test", namespace=OTHER_NAMESPACE)
+    pruned = replaced and wait_until(lambda: listed() == set(ids))
+    ok &= check("pruned", pruned, f"re-upserting one chunk leaves only {ids}")
+    return ok
+
+
 TESTS = [
     test_unpriced_model,
     test_usage_adds_up_offline,
@@ -330,19 +365,21 @@ TESTS = [
     test_force_bad,
     test_reingest,
     test_delete_document,  # must run after test_reingest, which leaves one chunk of the document
+    test_namespace_parameter,
 ]
 
 
-def delete_test_namespace() -> None:
-    """Delete the test namespace and everything in it."""
+def delete_test_namespaces() -> None:
+    """Delete both test namespaces and everything in them."""
 
-    if not NAMESPACE.startswith("test-rag-"):  # belt and braces: never the real corpus
-        raise RuntimeError(f"refusing to delete namespace {NAMESPACE!r}")
-    try:
-        rag.get_index().delete_namespace(name=NAMESPACE)
-        print(f"\nDeleted test namespace {NAMESPACE}")
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        print(f"\nCould not delete test namespace {NAMESPACE}: {type(exc).__name__}")
+    for namespace in (NAMESPACE, OTHER_NAMESPACE):
+        if not namespace.startswith("test-rag-"):  # belt and braces: never the real corpus
+            raise RuntimeError(f"refusing to delete namespace {namespace!r}")
+        try:
+            rag.get_index().delete_namespace(name=namespace)
+            print(f"\nDeleted test namespace {namespace}")
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            print(f"\nCould not delete test namespace {namespace}: {type(exc).__name__}")
 
 
 def main() -> int:
@@ -363,7 +400,7 @@ def main() -> int:
     finally:
         proc.terminate()
         proc.wait(timeout=5)
-        delete_test_namespace()
+        delete_test_namespaces()
 
     print("\n" + "=" * 40 + "\nSUMMARY")
     for name, ok in results:

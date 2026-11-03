@@ -147,24 +147,24 @@ def embedding_cost_usd(tokens: int) -> float:
     return tokens / 1_000_000 * EMBED_PRICE_PER_1M_USD
 
 
-def document_chunk_ids(document_id: str) -> set[str]:
+def document_chunk_ids(document_id: str, namespace: str = NAMESPACE) -> set[str]:
     """Every stored chunk ID of one document, found by ID prefix."""
 
     # "#" matters: slugs can't contain it, so prefix "handbook#" never matches "handbook-v2#0".
-    pages = get_index().list(prefix=f"{document_id}#", namespace=NAMESPACE)
+    pages = get_index().list(prefix=f"{document_id}#", namespace=namespace)
     return {item.id for page in pages for item in page.vectors}
 
 
-def delete_chunks(chunk_ids: set[str]) -> None:
+def delete_chunks(chunk_ids: set[str], namespace: str = NAMESPACE) -> None:
     """Delete chunks by ID, in batches Pinecone accepts."""
 
     ids = sorted(chunk_ids)
     for start in range(0, len(ids), DELETE_BATCH):
-        get_index().delete(ids=ids[start : start + DELETE_BATCH], namespace=NAMESPACE)
+        get_index().delete(ids=ids[start : start + DELETE_BATCH], namespace=namespace)
 
 
 def upsert_document(
-    document_id: str, chunks: list[str], source: str
+    document_id: str, chunks: list[str], source: str, namespace: str = NAMESPACE
 ) -> tuple[list[str], bool, int]:
     """
     Embed and upsert one document's chunks as "{document_id}#{i}", then delete any chunks
@@ -173,7 +173,7 @@ def upsert_document(
 
     vectors, embedding_tokens = embed(chunks)
     chunk_ids = [f"{document_id}#{i}" for i in range(len(chunks))]
-    existing = document_chunk_ids(document_id)
+    existing = document_chunk_ids(document_id, namespace)
 
     get_index().upsert(
         vectors=[
@@ -189,13 +189,13 @@ def upsert_document(
             }
             for i, (chunk_id, values, chunk) in enumerate(zip(chunk_ids, vectors, chunks))
         ],
-        namespace=NAMESPACE,
+        namespace=namespace,
         batch_size=UPSERT_BATCH,
         show_progress=False,
     )
 
     # Upsert first, prune second, so the document never disappears from the index mid-update.
-    delete_chunks(existing - set(chunk_ids))
+    delete_chunks(existing - set(chunk_ids), namespace)
     return chunk_ids, bool(existing), embedding_tokens
 
 
@@ -211,7 +211,7 @@ class Match:
 
 
 def retrieve(
-    question: str, top_k: int = 5, document_id: str | None = None
+    question: str, top_k: int = 5, document_id: str | None = None, namespace: str = NAMESPACE
 ) -> tuple[list[Match], int]:
     """Embed the question and return the top_k closest chunks, best first, plus embedding tokens."""
 
@@ -219,7 +219,7 @@ def retrieve(
     response = get_index().query(
         vector=vector,
         top_k=top_k,
-        namespace=NAMESPACE,
+        namespace=namespace,
         # Metadata filter: search inside one document instead of the whole namespace.
         filter={"document_id": {"$eq": document_id}} if document_id else None,
         include_metadata=True,
@@ -237,11 +237,20 @@ def retrieve(
     return matches, embedding_tokens
 
 
-def namespace_vector_count() -> int:
-    """Vectors in this service's namespace, as Pinecone counts them (lags writes slightly)."""
+def chunk_texts(chunk_ids: list[str], namespace: str = NAMESPACE) -> dict[str, str]:
+    """The stored text of chunks, looked up by ID; an ID Pinecone doesn't hold is simply absent."""
 
-    namespace = get_index().describe_index_stats().namespaces.get(NAMESPACE)
-    return namespace.vector_count if namespace else 0
+    if not chunk_ids:  # Pinecone rejects an empty fetch
+        return {}
+    vectors = get_index().fetch(ids=chunk_ids, namespace=namespace).vectors
+    return {chunk_id: vector.metadata["text"] for chunk_id, vector in vectors.items()}
+
+
+def namespace_vector_count(namespace: str = NAMESPACE) -> int:
+    """Vectors in a namespace, as Pinecone counts them (lags writes slightly)."""
+
+    summary = get_index().describe_index_stats().namespaces.get(namespace)
+    return summary.vector_count if summary else 0
 
 
 # Week 2 — grounding: the prompt /ask sends, and the rules its answers must pass.
