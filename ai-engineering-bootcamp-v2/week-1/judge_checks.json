@@ -1,0 +1,42 @@
+[
+  {
+    "id": "bad-unsupported-number",
+    "question": "What time does the Cambridge office open?",
+    "answer": "The Cambridge office opens at 06:00 on weekdays.",
+    "citations": ["doc6_facilities#0"],
+    "faithful": false,
+    "why": "The cited chunk says 07:30, not 06:00."
+  },
+  {
+    "id": "bad-unsupported-claim",
+    "question": "What is the WB-9 payload limit?",
+    "answer": "The WB-9 has a payload capacity of 25 kg and is certified for outdoor use.",
+    "citations": ["doc4_product#1"],
+    "faithful": false,
+    "why": "The cited chunk gives the payload but says nothing about outdoor use."
+  },
+  {
+    "id": "bad-wrong-chunk",
+    "question": "How many remote days are allowed?",
+    "answer": "Employees may work remotely up to three days per week.",
+    "citations": ["doc1_handbook#7"],
+    "faithful": false,
+    "why": "True, but doc1_handbook#4 says it, not the chunk cited."
+  },
+  {
+    "id": "good-mileage-rate",
+    "question": "What is the mileage rate?",
+    "answer": "The mileage rate is 45 pence per mile for travel over 50 miles.",
+    "citations": ["doc2_expenses#2"],
+    "faithful": true,
+    "why": "The cited chunk states both the rate and the 50-mile threshold."
+  },
+  {
+    "id": "good-policy-owner",
+    "question": "Who owns policy POL-220?",
+    "answer": "The owner of policy POL-220 is the Head of IT.",
+    "citations": ["doc5_it_acceptable_use#0"],
+    "faithful": true,
+    "why": "The cited chunk is the POL-220 header, which names the Head of IT as owner."
+  }
+]

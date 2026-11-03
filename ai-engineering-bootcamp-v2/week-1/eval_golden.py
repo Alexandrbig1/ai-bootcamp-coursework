@@ -7,10 +7,13 @@ Retrieval only, in-process through rag.py, with no server and no LLM:
   .venv/bin/python eval_golden.py --retrieval-only --namespace northwind --k 5
 Only the pre-flight check of the golden set against the corpus, with no API calls:
   .venv/bin/python eval_golden.py --preflight
+Only the judge's own check against known good and bad answers (exit code 1 if it fails):
+  .venv/bin/python eval_golden.py --check-judge
 
-Every eval starts with the pre-flight. A hit is the first retrieved chunk of the row's expected
-document that holds its evidence phrase. Retrieval and faithfulness cover the answerable rows;
-refusal accuracy and correctness cover every row, so a wrong refusal counts.
+Every eval starts with the pre-flight, and every full run also starts with the judge check. A hit
+is the first retrieved chunk of the row's expected document that holds its evidence phrase.
+Retrieval and faithfulness cover the answerable rows; refusal accuracy and correctness cover
+every row, so a wrong refusal counts.
 """
 
 import argparse
@@ -28,6 +31,7 @@ from main import Usage, client, compute_cost_usd
 
 WORKDIR = Path(__file__).resolve().parent
 GOLDEN_SET = WORKDIR / "golden_set.json"
+JUDGE_CHECKS = WORKDIR / "judge_checks.json"
 CORPUS_DIR = WORKDIR / "data" / "northwind"
 RESULTS_DIR = WORKDIR / "eval_results"
 BASE_URL = "http://127.0.0.1:8000"  # always the local server, whatever API_BASE_URL says
@@ -155,6 +159,7 @@ def judge(question: str, answer: str, cited: dict[str, str]) -> tuple[bool | Non
     )
     response = client.chat.completions.with_raw_response.parse(
         model=MODEL,
+        temperature=0,  # the same answer should get the same verdict on every run
         messages=[
             {"role": "system", "content": JUDGE_PROMPT},
             {
@@ -172,6 +177,34 @@ def judge(question: str, answer: str, cited: dict[str, str]) -> tuple[bool | Non
     if verdict is None:
         return None, "the judge returned no verdict", cost
     return verdict.faithful, normalize(verdict.reason), cost
+
+
+def check_judge() -> tuple[bool, float]:
+    """
+    A judge that always says yes would also score 100%, so it must reject the known-bad answers
+    in judge_checks.json and accept the known-good ones. Returns (passed, cost in USD).
+    """
+
+    passed = True
+    total_cost = 0.0
+    print("Judge check: it must reject the bad answers and accept the good ones")
+    for check in json.loads(JUDGE_CHECKS.read_text(encoding="utf-8")):
+        texts = rag.chunk_texts(check["citations"])
+        missing = [chunk_id for chunk_id in check["citations"] if chunk_id not in texts]
+        if missing:
+            print(f"  FAIL  {check['id']}: no chunk {missing} in namespace {rag.NAMESPACE!r}")
+            passed = False
+            continue
+        faithful, reason, cost = judge(check["question"], check["answer"], texts)
+        total_cost += cost
+        verdict_ok = faithful is check["faithful"]
+        passed = passed and verdict_ok
+        print(
+            f"  {'ok  ' if verdict_ok else 'FAIL'}  {check['id']}: faithful={faithful}, "
+            f"expected {check['faithful']} | {reason}"
+        )
+    print(f"Judge check {'passed' if passed else 'FAILED'}, ${total_cost:.8f}\n")
+    return passed, total_cost
 
 
 def evaluate_row(row: dict) -> dict:
@@ -236,7 +269,7 @@ def evaluate_row(row: dict) -> dict:
     }
 
 
-def summarize(results: list[dict]) -> dict:
+def summarize(results: list[dict], judge_check_cost: float = 0.0) -> dict:
     """The run's scores: retrieval and faithfulness over the answerable rows, the rest over all."""
 
     answerable = [result for result in results if not result["should_refuse"]]
@@ -252,7 +285,8 @@ def summarize(results: list[dict]) -> dict:
         "judged": len(judged),
         "ask_cost_usd": round(ask_cost, 8),
         "judge_cost_usd": round(judge_cost, 8),
-        "total_cost_usd": round(ask_cost + judge_cost, 8),
+        "judge_check_cost_usd": round(judge_check_cost, 8),
+        "total_cost_usd": round(ask_cost + judge_cost + judge_check_cost, 8),
     }
 
 
@@ -310,6 +344,11 @@ def run_full(rows: list[dict]) -> int:
         return 1
     print(f"Local server: {json.dumps(health)}\n")
 
+    judge_ok, judge_check_cost = check_judge()
+    if not judge_ok:
+        print("Stopping: a judge that fails its own check can't score this run.")
+        return 1
+
     results = [evaluate_row(row) for row in rows]
     print(
         markdown_table(
@@ -332,7 +371,7 @@ def run_full(rows: list[dict]) -> int:
         )
     )
 
-    summary = summarize(results)
+    summary = summarize(results, judge_check_cost)
     all_rows = summary["all_rows"]
     unjudged = summary["rows"] - summary["judged"]
     print(f"\nhit@5:            {fraction(summary['hit@5'], summary['rows'])}, answerable rows")
@@ -345,7 +384,8 @@ def run_full(rows: list[dict]) -> int:
     )
     print(
         f"total cost:       ${summary['total_cost_usd']:.8f} (/ask "
-        f"${summary['ask_cost_usd']:.8f} + judge ${summary['judge_cost_usd']:.8f})"
+        f"${summary['ask_cost_usd']:.8f} + judge ${summary['judge_cost_usd']:.8f} "
+        f"+ judge check ${summary['judge_check_cost_usd']:.8f})"
     )
 
     run = {
@@ -440,7 +480,15 @@ def main() -> int:
     parser.add_argument(
         "--preflight", action="store_true", help="only check the golden set against the corpus"
     )
+    parser.add_argument(
+        "--check-judge", action="store_true", help="only check the judge on known answers"
+    )
     args = parser.parse_args()
+    if (args.namespace or args.k is not None) and not args.retrieval_only:
+        parser.error("--namespace and --k only apply with --retrieval-only")
+
+    if args.check_judge:  # it doesn't use the golden set, so no pre-flight
+        return 0 if check_judge()[0] else 1
 
     rows = json.loads(GOLDEN_SET.read_text(encoding="utf-8"))
     passed = preflight(rows)
@@ -448,8 +496,6 @@ def main() -> int:
         return 0 if passed else 1
 
     if not args.retrieval_only:
-        if args.namespace or args.k is not None:
-            parser.error("--namespace and --k only apply with --retrieval-only")
         return run_full(rows)
 
     k = DEFAULT_K if args.k is None else args.k
