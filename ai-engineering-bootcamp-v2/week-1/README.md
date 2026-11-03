@@ -153,17 +153,24 @@ curl -s https://YOUR-SERVICE.onrender.com/health
 
 ### Golden set
 
-`golden_set.json` holds 8 questions whose expected answers were checked by hand against the documents: 6 answerable, one from each document, and 2 that must refuse. A retrieval hit means the row's evidence phrase appears in a retrieved chunk, so the same set works at any chunk size.
+`golden_set.json` holds 8 questions whose expected answers were checked by hand against the documents: 6 answerable, one from each document, and 2 that must refuse.
+
+- **A retrieval hit** means the row's evidence phrase appears in a retrieved chunk of its expected document, so the same set works at any chunk size.
+- **A correct answer** contains one accepted spelling of every required fact in `must_include`; a refusal must be exactly the refusal text.
+- **The pre-flight** runs before every eval: each answerable row needs required facts, and its evidence phrase must appear exactly once across the documents, inside its expected document. A missing corpus only warns.
+- **The judge check** runs at the start of every full run: the judge must reject the 3 bad answers and accept the 2 good ones in `judge_checks.json`, or the run stops.
 
 ```bash
 python eval_golden.py                                               # full run, against the local server
 python eval_golden.py --retrieval-only --namespace northwind --k 5  # retrieval only: no server, no LLM
+python eval_golden.py --preflight                                   # only the pre-flight, no API calls
+python eval_golden.py --check-judge                                 # only the judge check; exit 1 if it fails
 python chunk_experiment.py                                          # 800/100 vs 400/50, retrieval only
 ```
 
 Runs are saved to `eval_results/`, which is git-ignored.
 
-**Results.** One full run on 2026-11-02 at the default `top_k=5` over the 60 Northwind chunks, with gpt-4o-mini answering and a gpt-4o-mini judge checking each answer against the chunks it cites. Rank is where the evidence phrase first appears in the retrieved chunks.
+**Results.** One full run on 2026-11-02 at the default `top_k=5` over the 60 Northwind chunks, with gpt-4o-mini answering and a gpt-4o-mini judge checking each answer against the chunks it cites. Rank is the first retrieved chunk of the expected document that holds the evidence phrase.
 
 | Row | Question | Expected answer | Rank | Refusal OK | Correct | Faithful |
 |---|---|---|---|---|---|---|
@@ -184,7 +191,7 @@ Runs are saved to `eval_results/`, which is git-ignored.
 | Refusal accuracy | 8/8 | all rows |
 | Correctness | 8/8 | all rows |
 | Faithfulness | 6/6 | answerable rows |
-| Total cost | $0.0020 | `/ask` $0.0015 + judge $0.0005 |
+| Total cost | $0.00245 | `/ask` $0.00154 + judge $0.00054 + judge check $0.00037 |
 
 **Chunk-size comparison.** Retrieval only, top 5, with each size in its own namespace.
 
@@ -193,7 +200,7 @@ Runs are saved to `eval_results/`, which is git-ignored.
 | 800/100 (default) | 60 | 8,901 | 3/6 | 6/6 | 0.72 |
 | 400/50 | 142 | 9,276 | 4/6 | 5/6 | 0.75 |
 
-At 400/50, `remote-days` and `cambridge-hours` move up to rank 1, `mileage-rate` drops to rank 2, and `pol220-owner` falls out of the top 5. These numbers don't justify changing the default: `/ask` sends all five chunks to the model, so reaching the top 5 matters more than ranking first, and 400/50 needs 2.4 times the vectors.
+Every evidence phrase stays whole at both sizes, so no row is reported as split. At 400/50, `remote-days` and `cambridge-hours` move up to rank 1, `mileage-rate` drops to rank 2, and `pol220-owner` falls out of the top 5. These numbers don't justify changing the default: `/ask` sends all five chunks to the model, so reaching the top 5 matters more than ranking first, and 400/50 needs 2.4 times the vectors.
 
 **The WB-9 decision.** "How much does a WB-9 cost?" must refuse. The documents state no price. Section 9 of the product spec says "If the answer is not here, say you need Engineering confirmation", but that sentence speaks to Support and Sales about "can it do X?" questions, and the bot treats chunk text as data.
 
@@ -201,9 +208,10 @@ At 400/50, `remote-days` and `cambridge-hours` move up to rank 1, `mileage-rate`
 
 - **Retrieval (hit@5 6/6, hit@1 3/6, MRR 0.72):** The right chunk always reaches the model but ranks first only half the time, which is fine while `/ask` sends all five chunks.
 - **Refusals (8/8):** The prompt holds on a missing topic and on a near miss, though two refusal rows can't prove much.
-- **Correctness (8/8):** With the right chunk in the context, the model picks the right fact, but in a set this small one flipped row moves a score by at least 12 points.
-- **Faithfulness (6/6):** A judge that always says yes would score the same, so it also got three deliberately bad answers, and it rejected all three.
-- **Cost ($0.0020):** A full run is cheap enough to repeat after any change to retrieval or the prompt.
+- **Correctness (8/8):** With the right chunk in the context, the model gives every required fact, but in a set this small one flipped row moves a score by at least 12 points.
+- **Faithfulness (6/6):** A judge that always says yes would score the same, so every full run first proves it can reject bad answers and accept good ones.
+- **Stricter definitions:** Requiring every fact moved no score, and requiring the expected document can't while each phrase is unique to its document. The pre-flight's value is catching a bad phrase, and it caught one that appeared twice.
+- **Cost ($0.00245):** A full run is cheap enough to repeat after any change to retrieval or the prompt.
 - **Chunk size:** Summary scores can hide what matters, since 400/50 wins on MRR while losing the exact-ID row, so compare per question.
 - **WB-9 decision:** A refusal proves nothing about an instruction the model never saw, so check what was in the context before crediting the prompt.
 
@@ -217,6 +225,7 @@ week-1/
 ├── ingest_folder.py     # Week 2: POST every .txt file in a folder to /ingest
 ├── delete_document.py   # Week 2: local script that removes one document's chunks
 ├── golden_set.json      # Week 2: 8 questions with expected answers and evidence phrases
+├── judge_checks.json    # Week 2: known bad and good answers the judge must get right
 ├── eval_golden.py       # Week 2: scores /ask against the golden set, with a judge
 ├── chunk_experiment.py  # Week 2: compares chunk sizes on retrieval only
 ├── rag_page.py          # Week 2: Streamlit Ingest / Retrieve / Ask page
