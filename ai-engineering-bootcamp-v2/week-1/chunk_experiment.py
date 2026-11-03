@@ -9,14 +9,22 @@ are deleted at the end, whatever happens, and the real corpus is never read or w
 import json
 import sys
 import time
-from pathlib import Path
 
 from pinecone import PineconeError
 
 import rag
-from eval_golden import GOLDEN_SET, WORKDIR, fraction, markdown_table, retrieval_only, save_run
+from eval_golden import (
+    CORPUS_DIR,
+    GOLDEN_SET,
+    WORKDIR,
+    fraction,
+    markdown_table,
+    normalize,
+    preflight,
+    retrieval_only,
+    save_run,
+)
 
-CORPUS_DIR = Path(WORKDIR) / "data" / "northwind"
 SETTINGS = (("exp-800", 800, 100), ("exp-400", 400, 50))  # (namespace, chunk size, overlap)
 K = 5
 SETTLE_TIMEOUT = 120.0  # seconds; Pinecone's counts lag writes
@@ -32,6 +40,20 @@ def ingest(namespace: str, size: int, overlap: int) -> tuple[int, int]:
         total_chunks += len(ids)
         total_tokens += tokens
     return total_chunks, total_tokens
+
+
+def split_rows(rows: list[dict], size: int, overlap: int) -> list[str]:
+    """IDs of rows whose evidence phrase isn't whole in any chunk of its document at this size."""
+
+    split = []
+    for row in rows:
+        if row["should_refuse"]:
+            continue
+        path = CORPUS_DIR / f"{row['expected_document_id']}.txt"
+        chunks = rag.chunk_text(path.read_text(encoding="utf-8"), size=size, overlap=overlap)
+        if not any(normalize(row["evidence"]) in normalize(chunk) for chunk in chunks):
+            split.append(row["id"])
+    return split
 
 
 def wait_for_count(namespace: str, expected: int) -> bool:
@@ -64,6 +86,12 @@ def main() -> int:
     """Run both settings, print the comparison, and always clean up."""
 
     rows = json.loads(GOLDEN_SET.read_text(encoding="utf-8"))
+    if not preflight(rows):
+        return 1
+    if not any(CORPUS_DIR.glob("*.txt")):
+        print("This experiment embeds the corpus, so it can't continue without it.")
+        return 1
+
     results = []
     try:
         for namespace, size, overlap in SETTINGS:
@@ -72,15 +100,31 @@ def main() -> int:
             if not wait_for_count(namespace, chunks):
                 print(f"Pinecone didn't count {chunks} vectors in '{namespace}' in time; stopping.")
                 return 1
-            run = retrieval_only(rows, namespace, K)
+            split = split_rows(rows, size, overlap)
+            run = retrieval_only(rows, namespace, K, split=split)
             results.append(
-                {"size": size, "overlap": overlap, "chunks": chunks, "tokens": tokens, **run}
+                {
+                    "size": size,
+                    "overlap": overlap,
+                    "chunks": chunks,
+                    "tokens": tokens,
+                    "split_rows": split,
+                    **run,
+                }
             )
 
         print()
         print(
             markdown_table(
-                ["chunk size / overlap", "chunks", "embedding tokens", "hit@1", "hit@5", "MRR"],
+                [
+                    "chunk size / overlap",
+                    "chunks",
+                    "embedding tokens",
+                    "hit@1",
+                    "hit@5",
+                    "MRR",
+                    "split",
+                ],
                 [
                     [
                         f"{result['size']}/{result['overlap']}",
@@ -89,6 +133,7 @@ def main() -> int:
                         fraction(result["summary"]["hit@1"], result["summary"]["rows"]),
                         fraction(result["summary"]["hit@5"], result["summary"]["rows"]),
                         f"{result['summary']['mrr']:.4f}",
+                        ", ".join(result["split_rows"]) or "none",
                     ]
                     for result in results
                 ],

@@ -5,14 +5,18 @@ Full run, against the local server (start it first: .venv/bin/uvicorn main:app -
   .venv/bin/python eval_golden.py
 Retrieval only, in-process through rag.py, with no server and no LLM:
   .venv/bin/python eval_golden.py --retrieval-only --namespace northwind --k 5
+Only the pre-flight check of the golden set against the corpus, with no API calls:
+  .venv/bin/python eval_golden.py --preflight
 
-Retrieval and faithfulness cover the answerable rows; refusal accuracy and correctness cover
-every row, so a wrong refusal counts.
+Every eval starts with the pre-flight. A hit is the first retrieved chunk of the row's expected
+document that holds its evidence phrase. Retrieval and faithfulness cover the answerable rows;
+refusal accuracy and correctness cover every row, so a wrong refusal counts.
 """
 
 import argparse
 import json
 import sys
+from collections.abc import Collection
 from datetime import datetime
 from pathlib import Path
 
@@ -24,10 +28,12 @@ from main import Usage, client, compute_cost_usd
 
 WORKDIR = Path(__file__).resolve().parent
 GOLDEN_SET = WORKDIR / "golden_set.json"
+CORPUS_DIR = WORKDIR / "data" / "northwind"
 RESULTS_DIR = WORKDIR / "eval_results"
 BASE_URL = "http://127.0.0.1:8000"  # always the local server, whatever API_BASE_URL says
 MODEL = "gpt-4o-mini"  # for /ask and for the judge
 DEFAULT_K = 5
+SPLIT = "split"  # a row's rank when its evidence phrase doesn't survive whole at a chunk size
 TABLE_HEADERS = [
     "id",
     "rank",
@@ -66,25 +72,71 @@ def normalize(text: str) -> str:
     return " ".join(text.split())
 
 
-def evidence_rank(evidence: str, texts: list[str]) -> int | None:
-    """1-based rank of the first chunk holding the evidence phrase; None is a miss."""
+def evidence_rank(row: dict, retrieved: list[tuple[str, str]]) -> int | None:
+    """
+    1-based rank of the first chunk of the expected document that holds the evidence phrase;
+    None is a miss. retrieved holds (document_id, chunk text) pairs, best first.
+    """
 
-    phrase = normalize(evidence)
-    for rank, text in enumerate(texts, 1):
-        if phrase in normalize(text):
+    phrase = normalize(row["evidence"])
+    for rank, (document_id, text) in enumerate(retrieved, 1):
+        if document_id == row["expected_document_id"] and phrase in normalize(text):
             return rank
     return None
 
 
-def retrieval_scores(ranks: list[int | None]) -> dict:
-    """hit@1, hit@5 and MRR over the answerable rows' ranks; a miss scores zero."""
+def retrieval_scores(ranks: list[int | str | None]) -> dict:
+    """hit@1, hit@5 and MRR over the rows' ranks; a miss scores zero, a split row isn't scored."""
 
+    scored = [rank for rank in ranks if rank != SPLIT]
     return {
-        "rows": len(ranks),
-        "hit@1": sum(rank == 1 for rank in ranks),
-        "hit@5": sum(rank is not None and rank <= 5 for rank in ranks),
-        "mrr": round(sum(1 / rank for rank in ranks if rank) / len(ranks), 4),
+        "rows": len(scored),
+        "split": len(ranks) - len(scored),
+        "hit@1": sum(rank == 1 for rank in scored),
+        "hit@5": sum(rank is not None and rank <= 5 for rank in scored),
+        "mrr": round(sum(1 / rank for rank in scored if rank) / len(scored), 4) if scored else 0.0,
     }
+
+
+def cleaned_document(path: Path) -> str:
+    """A document after the chunker's cleaning and whitespace normalization, as a hit sees it."""
+
+    # A chunk size too big to ever cut anything, so only the cleaning applies.
+    chunks = rag.chunk_text(path.read_text(encoding="utf-8"), size=10**9, overlap=0)
+    return normalize(" ".join(chunks))
+
+
+def preflight(rows: list[dict]) -> bool:
+    """
+    Each evidence phrase must appear exactly once across the corpus, inside its expected document,
+    or a hit can't be trusted. Prints each row's result; False means stop. The corpus is
+    git-ignored, so a missing one only warns.
+    """
+
+    documents = {path.stem: cleaned_document(path) for path in sorted(CORPUS_DIR.glob("*.txt"))}
+    if not documents:
+        print(f"Pre-flight WARNING: no documents in {CORPUS_DIR.relative_to(WORKDIR)}/.")
+        print("Evidence phrases weren't checked; continuing.\n")
+        return True
+
+    answerable = [row for row in rows if not row["should_refuse"]]
+    failed = 0
+    print("Pre-flight: each evidence phrase must appear exactly once, in its expected document")
+    for row in answerable:
+        phrase, expected = normalize(row["evidence"]), row["expected_document_id"]
+        found = {name: text.count(phrase) for name, text in documents.items() if phrase in text}
+        found = found if phrase else {}  # an empty phrase matches everywhere, which means nothing
+        if found == {expected: 1}:
+            print(f"  ok    {row['id']}: once, in {expected}")
+            continue
+        failed += 1
+        where = ", ".join(f"{count}x in {name}" for name, count in found.items()) or "nowhere"
+        print(f"  FAIL  {row['id']}: {phrase!r} appears {where}; expected once, in {expected}")
+
+    print(f"{len(answerable) - failed} of {len(answerable)} evidence phrases OK.\n")
+    if failed:
+        print("Stopping: fix the phrases in golden_set.json before running an eval.")
+    return not failed
 
 
 def is_correct(row: dict, answer: str) -> bool:
@@ -153,12 +205,13 @@ def evaluate_row(row: dict) -> dict:
 
     data = response.json()
     answer = data["answer"]
-    retrieved_ids = [item["chunk_id"] for item in data["retrieved"]]
-    texts = rag.chunk_texts(retrieved_ids)
+    texts = rag.chunk_texts([item["chunk_id"] for item in data["retrieved"]])
     rank = None
     if not row["should_refuse"]:
-        ordered = [texts.get(chunk_id, "") for chunk_id in retrieved_ids]
-        rank = evidence_rank(row["evidence"], ordered)
+        rank = evidence_rank(
+            row,
+            [(item["document_id"], texts.get(item["chunk_id"], "")) for item in data["retrieved"]],
+        )
 
     faithful, reason, judge_cost = None, "skipped: refusal", 0.0
     if not answer["refused"]:
@@ -307,25 +360,33 @@ def run_full(rows: list[dict]) -> int:
     return 0
 
 
-def retrieval_only(rows: list[dict], namespace: str, k: int) -> dict:
-    """The answerable golden questions straight through rag.retrieve: no server, no LLM."""
+def retrieval_only(
+    rows: list[dict], namespace: str, k: int, split: Collection[str] = ()
+) -> dict:
+    """
+    The answerable golden questions straight through rag.retrieve: no server, no LLM. Rows named
+    in split can't hit at this chunk size, so they're reported as split rather than as misses.
+    """
 
     results = []
     for row in rows:
         if row["should_refuse"]:
             continue
-        matches, _ = rag.retrieve(row["question"], top_k=k, namespace=namespace)
-        results.append(
-            {
-                "id": row["id"],
-                "question": row["question"],
-                "rank": evidence_rank(row["evidence"], [match.text for match in matches]),
-                "retrieved": [
-                    {"chunk_id": match.chunk_id, "score": round(match.score, 4)}
-                    for match in matches
-                ],
-            }
-        )
+        result = {"id": row["id"], "question": row["question"], "rank": SPLIT, "retrieved": []}
+        if row["id"] not in split:
+            matches, _ = rag.retrieve(row["question"], top_k=k, namespace=namespace)
+            result["rank"] = evidence_rank(
+                row, [(match.document_id, match.text) for match in matches]
+            )
+            result["retrieved"] = [
+                {
+                    "chunk_id": match.chunk_id,
+                    "document_id": match.document_id,
+                    "score": round(match.score, 4),
+                }
+                for match in matches
+            ]
+        results.append(result)
     return {
         "mode": "retrieval-only",
         "namespace": namespace,
@@ -376,9 +437,16 @@ def main() -> int:
     )
     parser.add_argument("--namespace", help="with --retrieval-only: the namespace to search")
     parser.add_argument("--k", type=int, help="with --retrieval-only: chunks to fetch, at least 5")
+    parser.add_argument(
+        "--preflight", action="store_true", help="only check the golden set against the corpus"
+    )
     args = parser.parse_args()
 
     rows = json.loads(GOLDEN_SET.read_text(encoding="utf-8"))
+    passed = preflight(rows)
+    if args.preflight or not passed:
+        return 0 if passed else 1
+
     if not args.retrieval_only:
         if args.namespace or args.k is not None:
             parser.error("--namespace and --k only apply with --retrieval-only")
