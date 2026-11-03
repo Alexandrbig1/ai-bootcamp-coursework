@@ -1,6 +1,6 @@
 fastapi[standard]
 httpx
-openai
+openai>=3,<4
 pinecone>=10,<11
 python-dotenv
 streamlit
